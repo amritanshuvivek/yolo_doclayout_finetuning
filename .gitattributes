@@ -1,0 +1,56 @@
+# Set default behavior to automatically normalize line endings
+* text=auto eol=lf
+
+# Explicitly declare text files you want to always be normalized and converted to native line endings on checkout
+*.py text
+*.yaml text
+*.md text
+*.txt text
+*.sh text eol=lf
+*.yml text
+*.json text
+
+# Denote all files that are truly binary and should not be modified
+*.pt binary
+*.pth binary
+*.bin binary
+*.onnx binary
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.gif binary
+*.zip binary
+*.gz binary
+*.tar binary
+*.so binary
+*.dll binary
+*.exe binary
+*.dylib binary
+*.pyd binary
+*.pkl binary
+*.h5 binary
+*.hdf5 binary
+*.npy binary
+*.npz binary
+*.ptx binary
+*.cubin binary
+*.pdb binary
+*.pcm binary
+*.a binary
+*.lib binary
+*.o binary
+*.obj binary
+*.pyc binary
+*.pyo binary
+*.pyd binary
+*.so binary
+*.dylib binary
+*.pdb binary
+*.pcm binary
+*.a binary
+*.lib binary
+*.o binary
+*.obj binary
+*.pyc binary
+*.pyo binary
+*.pyd binary

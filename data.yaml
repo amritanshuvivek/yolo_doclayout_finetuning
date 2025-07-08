@@ -1,0 +1,19 @@
+# Dataset configuration for document layout detection
+train: /Users/amritanshuvivek/Documents/AI Projects/33_lekhanuvaad/layout_model_fine_tuning/data/train/images
+val: /Users/amritanshuvivek/Documents/AI Projects/33_lekhanuvaad/layout_model_fine_tuning/data/val/images
+
+# Number of classes
+nc: 10
+
+# Class names
+names:
+  0: title
+  1: plain text
+  2: abandon
+  3: figure
+  4: figure_caption
+  5: table
+  6: table_caption
+  7: table_footnote
+  8: isolate_formula
+  9: formula_caption
