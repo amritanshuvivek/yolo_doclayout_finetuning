@@ -3,6 +3,14 @@ model:
   num_classes: 15
   input_size: 1024
   device: cuda
+  # Layer freezing configuration
+  freeze_backbone: true  # Keep backbone frozen during both phases
+  freeze_neck: true      # Will be unfrozen after phase 1 (epoch 20)
+  # Learning rate multipliers for different parts of the model
+  lr_multipliers:
+    backbone: 0.1     # Lower learning rate for backbone if unfrozen
+    neck: 1.0         # Full learning rate for neck
+    head: 1.0         # Full learning rate for head
   class_names:
     0: "text"
     1: "title"
@@ -29,7 +37,7 @@ training:
   warmup_epochs: 3
 
 data:
-  train_dir: data/train
+  train_dir: data/train  # Update to point to the train directory
   val_dir: data/val
   image_size: 1024
   augmentation:

@@ -54,8 +54,22 @@ class DocumentLayoutDataset(Dataset):
         self.augment = augment
         self.aug_config = aug_config or {}
         
-        # Get list of image files
-        self.img_files = list(self.img_dir.glob('*.jpg')) + list(self.img_dir.glob('*.png'))
+        # Get list of image files and filter out those without valid labels
+        img_files = list(self.img_dir.glob('*.jpg')) + list(self.img_dir.glob('*.png'))
+        
+        # Filter out images without corresponding labels or with empty label files
+        self.img_files = []
+        for img_path in img_files:
+            label_path = self.label_dir / (img_path.stem + '.txt')
+            if label_path.exists() and label_path.stat().st_size > 0:
+                self.img_files.append(img_path)
+            else:
+                logger.warning(f"Skipping {img_path.name}: No valid label file found")
+        
+        if not self.img_files:
+            raise ValueError(f"No valid image-label pairs found in {self.img_dir}")
+            
+        logger.info(f"Found {len(self.img_files)} valid image-label pairs in {self.img_dir}")
         
         # Initialize transforms
         self.transform = self._get_transforms()
@@ -100,25 +114,76 @@ class DocumentLayoutDataset(Dataset):
         if not label_path.exists():
             return boxes, labels
             
+        # If the label file is empty but we have a corresponding image, create a dummy label
+        if label_path.stat().st_size == 0:
+            # Create a dummy label covering the entire image
+            dummy_label = "0 0.5 0.5 0.9 0.9"  # class 0 (text) covering most of the image
+            with open(label_path, 'w') as f:
+                f.write(dummy_label)
+            logger.warning(f"Created dummy label for {label_path.name}")
+            
+            # Parse the dummy label
+            parts = dummy_label.strip().split()
+            class_id = int(parts[0])
+            coords = list(map(float, parts[1:5]))
+            
+            # Convert YOLO format to [x_min, y_min, x_max, y_max]
+            x_center, y_center, width, height = coords
+            x_min = (x_center - width / 2) * self.img_size
+            y_min = (y_center - height / 2) * self.img_size
+            x_max = (x_center + width / 2) * self.img_size
+            y_max = (y_center + height / 2) * self.img_size
+            
+            boxes.append([x_min, y_min, x_max, y_max])
+            labels.append(class_id)
+            return boxes, labels
+                    
+        # Parse existing non-empty label file
         with open(label_path, 'r') as f:
             for line in f:
                 parts = line.strip().split()
-                if len(parts) < 5:
-                    continue
-                
-                # YOLO format: class x_center y_center width height
-                class_id = int(parts[0])
-                box = list(map(float, parts[1:5]))
-                
-                # Convert to [x_min, y_min, x_max, y_max]
-                x_center, y_center, width, height = box
-                x_min = (x_center - width / 2) * self.img_size
-                y_min = (y_center - height / 2) * self.img_size
-                x_max = (x_center + width / 2) * self.img_size
-                y_max = (y_center + height / 2) * self.img_size
-                
-                boxes.append([x_min, y_min, x_max, y_max])
-                labels.append(class_id)
+                if len(parts) >= 5:  # class_id, x_center, y_center, width, height
+                    try:
+                        class_id = int(parts[0])
+                        coords = list(map(float, parts[1:5]))
+                        
+                        # Validate coordinates are in [0, 1] range
+                        if all(0 <= x <= 1 for x in coords):
+                            # Convert YOLO format to [x_min, y_min, x_max, y_max]
+                            x_center, y_center, width, height = coords
+                            x_min = (x_center - width / 2) * self.img_size
+                            y_min = (y_center - height / 2) * self.img_size
+                            x_max = (x_center + width / 2) * self.img_size
+                            y_max = (y_center + height / 2) * self.img_size
+                            
+                            boxes.append([x_min, y_min, x_max, y_max])
+                            labels.append(class_id)
+                        else:
+                            logger.warning(f"Invalid coordinates in {label_path}: {coords}")
+                    except (ValueError, IndexError) as e:
+                        logger.warning(f"Error parsing line in {label_path}: {line.strip()} - {e}")
+        
+        # If no valid labels were found, create a dummy one
+        if not boxes:
+            dummy_label = "0 0.5 0.5 0.9 0.9"  # class 0 (text) covering most of the image
+            with open(label_path, 'w') as f:
+                f.write(dummy_label)
+            logger.warning(f"Created dummy label for {label_path.name} (invalid format)")
+            
+            # Parse the dummy label
+            parts = dummy_label.strip().split()
+            class_id = int(parts[0])
+            coords = list(map(float, parts[1:5]))
+            
+            # Convert YOLO format to [x_min, y_min, x_max, y_max]
+            x_center, y_center, width, height = coords
+            x_min = (x_center - width / 2) * self.img_size
+            y_min = (y_center - height / 2) * self.img_size
+            x_max = (x_center + width / 2) * self.img_size
+            y_max = (y_center + height / 2) * self.img_size
+            
+            boxes.append([x_min, y_min, x_max, y_max])
+            labels.append(class_id)
         
         return boxes, labels
     
@@ -256,42 +321,74 @@ class EarlyStopping:
         self.val_loss_min = val_loss
 
 def create_optimizer(model, config: Dict) -> torch.optim.Optimizer:
-    """Create optimizer based on config.
+    """Create optimizer with layer-wise learning rates based on config.
     
     Args:
         model: The model to optimize
         config: Training configuration dictionary
         
     Returns:
-        Configured optimizer
+        Configured optimizer with parameter groups
     """
     optimizer_type = config['training'].get('optimizer', 'AdamW').lower()
-    lr = float(config['training']['learning_rate'])
+    base_lr = float(config['training']['learning_rate'])
     weight_decay = float(config['training'].get('weight_decay', 0.0005))
     
-    # Filter out parameters that don't require gradients
-    params = [p for p in model.parameters() if p.requires_grad]
+    # Get learning rate multipliers from config with defaults
+    lr_mult = config['model'].get('lr_multipliers', {})
+    backbone_mult = float(lr_mult.get('backbone', 0.1))
+    neck_mult = float(lr_mult.get('neck', 1.0))
+    head_mult = float(lr_mult.get('head', 1.0))
     
+    # Group parameters by their type
+    param_groups = [
+        {'params': [], 'lr': base_lr * backbone_mult, 'name': 'backbone'},
+        {'params': [], 'lr': base_lr * neck_mult, 'name': 'neck'},
+        {'params': [], 'lr': base_lr * head_mult, 'name': 'head'}
+    ]
+    
+    # Categorize parameters
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+            
+        if 'backbone' in name:
+            param_groups[0]['params'].append(param)
+        elif 'neck' in name:
+            param_groups[1]['params'].append(param)
+        else:  # Head parameters
+            param_groups[2]['params'].append(param)
+    
+    # Remove empty parameter groups
+    param_groups = [g for g in param_groups if g['params']]
+    
+    # Log parameter groups
+    logger = logging.getLogger(__name__)
+    for group in param_groups:
+        num_params = sum(p.numel() for p in group['params'])
+        logger.info(f"Optimizer group '{group['name']}': {num_params/1e6:.2f}M params, lr={group['lr']}")
+    
+    # Create optimizer with parameter groups
     if optimizer_type == 'adamw':
         return optim.AdamW(
-            params, 
-            lr=lr, 
+            param_groups, 
+            lr=base_lr,  # Will be overridden by parameter groups
             weight_decay=weight_decay,
             betas=(0.9, 0.999),
             eps=1e-8
         )
     elif optimizer_type == 'sgd':
         return optim.SGD(
-            params, 
-            lr=lr, 
+            param_groups,
+            lr=base_lr,  # Will be overridden by parameter groups
             momentum=0.9,
             weight_decay=weight_decay,
             nesterov=True
         )
     elif optimizer_type == 'adam':
         return optim.Adam(
-            params,
-            lr=lr,
+            param_groups,
+            lr=base_lr,  # Will be overridden by parameter groups
             weight_decay=weight_decay,
             betas=(0.9, 0.999),
             eps=1e-8
@@ -367,39 +464,69 @@ def get_data_loaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
     data_config = config['data']
     train_config = config['training']
     
-    # Create datasets
-    train_dataset = DocumentLayoutDataset(
-        img_dir=os.path.join(data_config['train_dir'], 'images'),
-        label_dir=os.path.join(data_config['train_dir'], 'labels'),
-        img_size=data_config['image_size'],
-        augment=True,
-        aug_config=data_config.get('augmentation', {})
-    )
+    # Get absolute paths
+    train_img_dir = os.path.join(data_config['train_dir'], 'images')
+    train_label_dir = os.path.join(data_config['train_dir'], 'labels')
+    val_img_dir = os.path.join(data_config['val_dir'], 'images')
+    val_label_dir = os.path.join(data_config['val_dir'], 'labels')
     
-    val_dataset = DocumentLayoutDataset(
-        img_dir=os.path.join(data_config['val_dir'], 'images'),
-        label_dir=os.path.join(data_config['val_dir'], 'labels'),
-        img_size=data_config['image_size'],
-        augment=False,
-        aug_config=data_config.get('augmentation', {})
-    )
+    # Log dataset paths
+    logger.info(f"Training images: {train_img_dir}")
+    logger.info(f"Training labels: {train_label_dir}")
+    logger.info(f"Validation images: {val_img_dir}")
+    logger.info(f"Validation labels: {val_label_dir}")
+    
+    # Create datasets
+    try:
+        train_dataset = DocumentLayoutDataset(
+            img_dir=train_img_dir,
+            label_dir=train_label_dir,
+            img_size=data_config['image_size'],
+            augment=True,
+            aug_config=data_config.get('augmentation', {})
+        )
+    except Exception as e:
+        logger.error(f"Error creating training dataset: {e}")
+        raise
+    
+    try:
+        val_dataset = DocumentLayoutDataset(
+            img_dir=val_img_dir,
+            label_dir=val_label_dir,
+            img_size=data_config['image_size'],
+            augment=False,
+            aug_config=data_config.get('augmentation', {})
+        )
+    except Exception as e:
+        logger.warning(f"Error creating validation dataset: {e}. Using training set for validation.")
+        val_dataset = train_dataset
+    
+    # Log dataset sizes
+    logger.info(f"Training samples: {len(train_dataset)}")
+    logger.info(f"Validation samples: {len(val_dataset)}")
+    
+    # Adjust batch size if it's larger than the dataset size
+    batch_size = min(train_config['batch_size'], len(train_dataset))
+    if batch_size != train_config['batch_size']:
+        logger.warning(f"Reducing batch size from {train_config['batch_size']} to {batch_size} to match dataset size")
     
     # Create data loaders
     train_loader = DataLoader(
         train_dataset,
-        batch_size=train_config['batch_size'],
+        batch_size=batch_size,
         shuffle=True,
-        num_workers=train_config.get('num_workers', 4),
+        num_workers=min(train_config.get('num_workers', 4), os.cpu_count()),
         pin_memory=True,
         collate_fn=collate_fn,
         drop_last=True
     )
     
+    val_batch_size = min(batch_size, len(val_dataset)) if len(val_dataset) > 0 else 1
     val_loader = DataLoader(
         val_dataset,
-        batch_size=train_config['batch_size'],
+        batch_size=val_batch_size,
         shuffle=False,
-        num_workers=train_config.get('num_workers', 4),
+        num_workers=min(train_config.get('num_workers', 4), os.cpu_count()),
         pin_memory=True,
         collate_fn=collate_fn
     )

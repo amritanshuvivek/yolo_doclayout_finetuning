@@ -140,7 +140,7 @@ class DocumentLayoutTrainer:
         }
     
     def _init_model(self):
-        """Initialize the YOLOv10 model."""
+        """Initialize the YOLOv10 model with layer freezing control."""
         try:
             model_path = self.config['model']['pretrained']
             self.logger.info(f"Loading model from {model_path}")
@@ -151,26 +151,74 @@ class DocumentLayoutTrainer:
                 if os.path.exists(checkpoint_path):
                     model_path = checkpoint_path
             
-            # Load the model first
+            # Load the model
             model = YOLOv10(model_path).to(self.device)
             
-            # Set the data configuration path as an attribute
+            # Set the data configuration
             data_config = os.path.abspath('data.yaml')
+            if not os.path.exists(data_config):
+                raise FileNotFoundError(f"Data configuration file not found at {data_config}")
+                
+            # Set the data configuration path
+            model.data = data_config
             self.logger.info(f"Using data configuration from {data_config}")
-            model.data = data_config  # Store the data config path for later use
             
-            # Log model architecture
+            # Initial layer freezing (will be updated in train_epoch)
+            self._set_model_trainable_layers(model, freeze_backbone=True, freeze_neck=True)
+            
+            # Log model architecture and parameters
             self.logger.info(f"Model architecture:\n{model}")
-            self.logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
+            self._log_model_parameters(model)
             
             return model
             
         except Exception as e:
             self.logger.error(f"Error loading model: {e}")
             raise
+            
+    def _set_model_trainable_layers(self, model, freeze_backbone=True, freeze_neck=True):
+        """Set which parts of the model should be trainable.
+        
+        Args:
+            model: The YOLOv10 model
+            freeze_backbone: Whether to freeze backbone layers
+            freeze_neck: Whether to freeze neck layers
+        """
+        for name, param in model.named_parameters():
+            if 'backbone' in name:
+                param.requires_grad = not freeze_backbone
+                self.logger.debug(f"{'Freezing' if freeze_backbone else 'Unfreezing'} backbone layer: {name}")
+            elif 'neck' in name:  # Adjust 'neck' based on actual layer names in your model
+                param.requires_grad = not freeze_neck
+                self.logger.debug(f"{'Freezing' if freeze_neck else 'Unfreezing'} neck layer: {name}")
+            else:  # Head layers
+                param.requires_grad = True
+                self.logger.debug(f"Training head layer: {name}")
+        
+        # Log which parts are frozen
+        self.logger.info(f"Backbone frozen: {freeze_backbone}")
+        self.logger.info(f"Neck frozen: {freeze_neck}")
+        self.logger.info("Head is trainable")
+        
+        # Reinitialize optimizer with new parameters
+        self.optimizer = create_optimizer(model, self.config)
+        
+        # Only create scheduler if train_loader is available
+        if hasattr(self, 'train_loader'):
+            self.scheduler = create_scheduler(
+                self.optimizer, 
+                self.config,
+                train_loader=self.train_loader
+            )
+    
+    def _log_model_parameters(self, model):
+        """Log model parameter counts."""
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        self.logger.info(f"Model parameters: {total_params/1e6:.2f}M total, {trainable_params/1e6:.2f}M trainable")
     
     def train_epoch(self, epoch: int):
-        """Train the model for one epoch.
+        """Train the model for one epoch with phase-based layer freezing.
         
         Args:
             epoch: Current epoch number
@@ -178,9 +226,31 @@ class DocumentLayoutTrainer:
         Returns:
             Average training loss for the epoch
         """
-        # Initialize model with data configuration
+        # Phase 2: Unfreeze neck after epoch 20
+        if epoch == 20:
+            self.logger.info("\n=== PHASE 2: Unfreezing neck layers ===")
+            self._set_model_trainable_layers(self.model, 
+                                           freeze_backbone=True, 
+                                           freeze_neck=False)
+        
+        # Ensure model has data configuration
         data_config = os.path.abspath('data.yaml')
+        if not os.path.exists(data_config):
+            raise FileNotFoundError(f"Data configuration file not found at {data_config}")
+            
+        # Set the data configuration
         self.model.data = data_config
+        self.logger.info(f"Using data configuration from: {data_config}")
+        
+        # Make sure the data file exists at the expected location
+        if not os.path.exists('coco8.yaml'):
+            # Create a symbolic link if it doesn't exist
+            try:
+                os.symlink('data.yaml', 'coco8.yaml')
+                self.logger.info("Created symbolic link from data.yaml to coco8.yaml")
+            except FileExistsError:
+                # Link already exists, which is fine
+                pass
         
         # Set model to training mode
         self.model.train()
